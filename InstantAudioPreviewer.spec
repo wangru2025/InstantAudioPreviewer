@@ -1,11 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+VLC_PATH = 'C:\\Program Files\\VideoLAN\\VLC'
 
 a = Analysis(
     ['InstantAudioPreviewer.py'],
-    pathex=['.'],
-    binaries=[('ZDSRAPI_x64.dll', '.'), ('SDL2_mixer.dll', '.'), ('SDL2.dll', '.'), ('nvdaControllerClient.dll', '.'), ('libxmp.dll', '.'), ('libwavpack-1.dll', '.'), ('libopusfile-0.dll', '.'), ('libopus-0.dll', '.'), ('libogg-0.dll', '.'), ('libgme.dll', '.')],
-    datas=[],
+    pathex=[],
+    binaries=[('libvlc.dll', '.'), ('libvlccore.dll', '.'), ('nvdaControllerClient.dll', '.'), ('ZDSRAPI_x64.dll', '.')],
+    datas=[
+        # --- VLC Runtime Files ---
+        (f'{VLC_PATH}\\libvlc.dll', '.'), # 确保 libvlc.dll 也被包含
+        (f'{VLC_PATH}\\libvlccore.dll', '.'), # 确保 libvlccore.dll 也被包含
+        (f'{VLC_PATH}\\plugins', 'plugins'), # 包含 VLC 的插件目录，非常重要！
+        # 根据你的程序需求，可能还需要包含 VLC 的其他资源文件，例如：
+        # (f'{VLC_PATH}\\vlc.exe', 'vlc.exe'), # 如果你的代码直接调用 vlc.exe
+        # (f'{VLC_PATH}\\vlc.ico', '.'),
+        # (f'{VLC_PATH}\\playlist.xml', '.'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

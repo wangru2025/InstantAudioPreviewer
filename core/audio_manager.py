@@ -1,895 +1,411 @@
-import sdl2
-import sdl2.sdlmixer
-import os
-import sys
-import time
+import wx
+import threading
 import queue
 import atexit
-import threading
-import wx
+import os
+import time
+import sys
+import vlc # 导入 python-vlc
 
-# --- DLL 加载路径处理 (仅在此处添加，不修改其他函数逻辑) ---
-if sys.platform == "win32":
-    # 确定脚本的目录或可执行文件的目录
-    # getattr(sys, 'frozen', False) 检查程序是否被打包（例如用 Nuitka）
-    # sys.executable 是打包后的 .exe 文件路径
-    # __file__ 是脚本本身的文件路径
-    # 这个逻辑能正确获取到程序（或脚本）运行的根目录
-    program_root_dir = os.path.dirname(os.path.abspath(getattr(sys, 'frozen', False) and sys.executable or __file__))
-
-    # 将程序运行的根目录添加到 DLL 搜索路径
-    # 这确保了与 .exe 或主脚本同级的 DLL 可以被找到
-    try:
-        os.add_dll_directory(program_root_dir)
-        # print(f"DLL search path added: {program_root_dir}") # 调试输出
-    except Exception as e:
-        # Python 3.8+ 支持 os.add_dll_directory
-        # 对于旧版本或者权限问题，可能会失败
-        print(f"Warning: Failed to add '{program_root_dir}' to DLL search paths using os.add_dll_directory: {e}")
-        # 如果 os.add_dll_directory 失败，作为备用方案，尝试修改 PATH 环境变量
-        # 注意：修改 PATH 可能会影响整个进程，通常不推荐，但作为兼容性考虑
-        # 如果你的 Python 版本低于 3.8，则需要此行
-        # if program_root_dir not in os.environ['PATH']:
-        #     os.environ['PATH'] = program_root_dir + os.pathsep + os.environ['PATH']
-        #     print(f"Warning: Falling back to modifying PATH environment variable.")
-
-    # 尝试查找 PySDL2 自身的 bin 目录，并添加到 DLL 搜索路径
-    # 在非打包环境下，PySDL2 的 DLL 默认可能在这里
-    try:
-        # 导入 sdl2 的内部模块以获取其安装路径
-        # _sdl2 是一个内部的、可能包含 DLL 的模块
-        import sdl2._sdl2
-        sdl2_module_path = os.path.dirname(sdl2._sdl2.__file__)
-        sdl2_bin_path = os.path.join(sdl2_module_path, "bin")
-        if os.path.isdir(sdl2_bin_path):
-            os.add_dll_directory(sdl2_bin_path)
-            # print(f"DLL search path added: {sdl2_bin_path}") # 调试输出
-    except (ImportError, AttributeError, OSError) as e:
-        # 如果 sdl2._sdl2 模块不存在、或 __file__ 不可用、或路径无效
-        print(f"Warning: Could not find or add PySDL2's bin directory to DLL search paths: {e}")
-# --- DLL 加载路径处理结束 ---
-
-
-# 尝试导入自定义日志配置，如果失败则使用基础的控制台日志
+# 导入 logger
 try:
     from utils.logger_config import logger
+    logger.info("utils.logger_config 模块已成功导入。")
 except ImportError:
     import logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
-    handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.warning("无法导入 utils.logger_config。正在使用基础控制台日志。")
+    logger.warning("使用备用的基础 logger。")
 
-# 获取脚本的目录，用于查找资源文件。现在这个变量将始终指向程序执行的根目录。
-# program_root_dir 是我们在上面 DLL 处理中定义的，现在直接使用它。
-script_dir = program_root_dir
-
-# 全局变量
-_main_frame_ref = None  # 对主窗口的引用，用于更新GUI
-audio_command_queue = queue.Queue() # 用于在不同线程间安全地传递音频命令
-
-_current_music = None  # 当前加载的音乐对象 (sdl2.sdlmixer.Mix_Music*)
-_current_file_path = None  # 当前正在播放的文件的完整路径
-_audio_system_initialized = False  # 标记音频系统是否已成功初始化
-
-# 音频播放状态常量
+# 播放状态常量
 PLAYBACK_STATUS_STOPPED = "stopped"
 PLAYBACK_STATUS_PLAYING = "playing"
 PLAYBACK_STATUS_PAUSED = "paused"
-_current_playback_status = PLAYBACK_STATUS_STOPPED  # 当前播放状态
 
-# 跟踪最后成功播放的文件路径
-_last_played_file_path = None
+# VLC 实例和播放器
+_vlc_instance = None
+_vlc_player = None
+_audio_system_initialized = False
+_last_played_file_path = None # 记录最后播放的文件路径
+_music_duration_ms = 0 # 记录当前音乐的总时长（毫秒）
+_playback_status = PLAYBACK_STATUS_STOPPED # 初始化播放状态
 
-# 定义快进快退的默认步长（秒）
-DEFAULT_SEEK_STEP = 5.0
+# 队列用于从其他线程向音频播放线程发送命令
+audio_command_queue = queue.Queue()
 
-def set_frame_reference(frame_instance):
-    """设置主窗口的引用，以便音频模块可以更新GUI。"""
+# 用于主窗口的引用，以便在其他线程中更新 GUI
+_main_frame_ref = None
+
+# --- 硬编码 VLC 的安装路径 ---
+# 请根据你的实际安装路径修改此变量，指向 VLC 的安装目录，例如 C:\Program Files\VideoLAN\VLC
+VLC_INSTALL_PATH = r"C:\Program Files\VideoLAN\VLC"
+
+def set_frame_reference(frame):
+    """设置主窗口的引用，用于通过 wx.CallAfter 更新 GUI。"""
     global _main_frame_ref
-    _main_frame_ref = frame_instance
-    logger.debug("主窗口引用已设置。")
+    _main_frame_ref = frame
+    logger.debug("audio_manager: 主窗口引用已设置。")
 
-def get_last_played_file_path():
-    """返回最后成功播放的音频文件的完整路径。"""
-    return _last_played_file_path
+def is_audio_system_initialized():
+    """检查音频系统是否已初始化。"""
+    return _audio_system_initialized
 
-def get_mixer_dll_paths():
+def _vlc_playback_thread():
     """
-    辅助函数，用于检查 SDL2_mixer 及其依赖 DLL 是否可能存在于预期路径。
-    注意：这不保证 DLL 能被正确加载。
+    VLC 音频播放线程。负责处理 command_queue 中的命令。
+    VLC 播放器本身在内部处理大部分播放逻辑，此线程主要用于调度命令和更新状态。
     """
-    # 核心 DLLs，这些是 SDL_mixer 运行时可能依赖的
-    # 这是基于你最初提供的列表和常见依赖。
-    dll_names = [
-        "SDL2.dll",
-        "SDL2_mixer.dll",
-        "libxmp.dll",
-        "libwavpack-1.dll",
-        "libopusfile-0.dll",
-        "libopus-0.dll",
-        "libogg-0.dll",
-        "libgme.dll",
-        # 常见 SDL_mixer 格式支持 DLLs，即使你未明确列出，也可能需要
-        "libmpg123-0.dll", # MP3 支持
-        "libvorbis-0.dll",
-        "libvorbisfile-3.dll",
-        "FLAC.dll",        # FLAC 支持
-        "zlib1.dll",       # 常见的通用压缩库依赖
-        # 其他你系统或 SDL2_mixer 版本可能需要的 DLL
-        # 例如 libgcc_s_seh-1.dll, libstdc++-6.dll (如果使用 MinGW 编译的 DLL)
-    ]
+    global _vlc_player, _vlc_instance, _playback_status, _last_played_file_path, _music_duration_ms
 
-    missing_dlls = []
-    # 确定查找 DLL 的基础目录
-    # 现在 `script_dir` 已经正确指向程序运行的根目录
-    base_dirs = [script_dir]
+    logger.info("VLC 音频播放线程已启动。")
+    _playback_status = PLAYBACK_STATUS_STOPPED
 
-    # 在打包后，PySDL2 的 bin 目录中的 DLL 理论上会被 Nuitka 复制到 script_dir
-    # 但为了以防万一或非打包环境，仍然可以尝试检查 PySDL2 自身的 bin 目录
-    try:
-        import sdl2._sdl2 # 导入内部模块
-        sdl2_module_path = os.path.dirname(sdl2._sdl2.__file__)
-        sdl2_bin_path = os.path.join(sdl2_module_path, "bin")
-        if os.path.isdir(sdl2_bin_path) and sdl2_bin_path not in base_dirs:
-            base_dirs.append(sdl2_bin_path)
-    except (ImportError, AttributeError, OSError):
-        pass # 如果找不到或出错，忽略
+    while True:
+        try:
+            command, arg = audio_command_queue.get(timeout=0.1) # 短暂超时，以便线程可以被终止
+            logger.debug(f"音频线程收到命令: {command}, 参数: {arg}")
 
-    # 确保目录列表不包含重复项
-    unique_base_dirs = []
-    for d in base_dirs:
-        if d not in unique_base_dirs:
-            unique_base_dirs.append(d)
+            if command == "play":
+                if _vlc_player:
+                    _vlc_player.stop() # 停止当前播放
+                    media = _vlc_instance.media_new(arg)
+                    _vlc_player.set_media(media)
+                    _vlc_player.play()
+                    _playback_status = PLAYBACK_STATUS_PLAYING
+                    _last_played_file_path = arg
+                    # 尝试获取媒体时长
+                    media.parse() # 解析媒体信息
+                    # 等待媒体解析完成并获取时长
+                    for _ in range(50): # 尝试5秒内获取时长，每100ms一次
+                        duration = media.get_duration()
+                        if duration > 0:
+                            _music_duration_ms = duration
+                            break
+                        time.sleep(0.1)
+                    if _music_duration_ms <= 0:
+                        logger.warning(f"未能获取媒体时长: {arg}")
+                    logger.info(f"开始播放: {arg}, 时长: {_music_duration_ms / 1000:.2f}s")
+                    if _main_frame_ref:
+                        wx.CallAfter(_main_frame_ref.update_status_message, f"正在播放: {os.path.basename(arg)}")
 
-    found_dlls = set()
+            elif command == "stop":
+                if _vlc_player and (_vlc_player.is_playing() or _vlc_player.get_state() == vlc.State.Paused):
+                    _vlc_player.stop()
+                    _playback_status = PLAYBACK_STATUS_STOPPED
+                    logger.info("停止播放。")
+                    if _main_frame_ref:
+                        wx.CallAfter(_main_frame_ref.update_status_message, "播放已停止。")
 
-    # 遍历所有需要的 DLL 文件
-    for dll_name in dll_names:
-        found = False
-        # 在所有可能的基目录中搜索
-        for base_dir in unique_base_dirs:
-            full_path = os.path.join(base_dir, dll_name)
-            if os.path.exists(full_path):
-                found_dlls.add(dll_name)
-                found = True
-                break # 找到就停止搜索当前 DLL
-        if not found:
-            missing_dlls.append(dll_name) # 如果在所有目录都没找到，则记录为缺失
+            elif command == "pause":
+                if _vlc_player and _vlc_player.is_playing():
+                    _vlc_player.set_pause(1)
+                    _playback_status = PLAYBACK_STATUS_PAUSED
+                    logger.info("暂停播放。")
+                    if _main_frame_ref:
+                        wx.CallAfter(_main_frame_ref.update_status_message, "播放已暂停。")
 
-    return missing_dlls
+            elif command == "resume":
+                if _vlc_player and _vlc_player.get_state() == vlc.State.Paused:
+                    _vlc_player.set_pause(0)
+                    _playback_status = PLAYBACK_STATUS_PLAYING
+                    logger.info("恢复播放。")
+                    if _main_frame_ref:
+                        wx.CallAfter(_main_frame_ref.update_status_message, "播放已恢复。")
+
+            elif command == "toggle_play_pause":
+                if _vlc_player:
+                    current_state = _vlc_player.get_state()
+                    if current_state == vlc.State.Playing:
+                        _vlc_player.set_pause(1)
+                        _playback_status = PLAYBACK_STATUS_PAUSED
+                        logger.info("播放器状态切换到暂停。")
+                        if _main_frame_ref:
+                            wx.CallAfter(_main_frame_ref.update_status_message, "播放已暂停。")
+                    elif current_state == vlc.State.Paused:
+                        _vlc_player.set_pause(0)
+                        _playback_status = PLAYBACK_STATUS_PLAYING
+                        logger.info("播放器状态切换到播放。")
+                        if _main_frame_ref:
+                            wx.CallAfter(_main_frame_ref.update_status_message, "播放已恢复。")
+                    elif current_state == vlc.State.Stopped and _last_played_file_path:
+                        # 如果是停止状态，尝试重新播放上次的媒体
+                        media = _vlc_instance.media_new(_last_played_file_path)
+                        _vlc_player.set_media(media)
+                        _vlc_player.play()
+                        _playback_status = PLAYBACK_STATUS_PLAYING
+                        logger.info(f"重新播放上次媒体: {_last_played_file_path}")
+                        if _main_frame_ref:
+                            wx.CallAfter(_main_frame_ref.update_status_message, f"正在播放: {os.path.basename(_last_played_file_path)}")
+
+            elif command == "seek":
+                if _vlc_player and (_vlc_player.is_playing() or _vlc_player.get_state() == vlc.State.Paused) and _music_duration_ms > 0:
+                    current_time_ms = _vlc_player.get_time()
+                    if current_time_ms == -1: # get_time() might return -1 if media is not ready or playing
+                        logger.warning("VLC get_time() returned -1, cannot seek accurately.")
+                        continue
+                    
+                    # arg 是秒数，转换为毫秒
+                    seek_delta_ms = int(arg * 1000)
+                    new_time_ms = current_time_ms + seek_delta_ms
+
+                    # 边界检查
+                    if new_time_ms < 0:
+                        new_time_ms = 0
+                    elif new_time_ms > _music_duration_ms:
+                        new_time_ms = _music_duration_ms
+
+                    _vlc_player.set_time(new_time_ms)
+                    logger.info(f"跳转到: {new_time_ms / 1000:.2f}s (从 {current_time_ms / 1000:.2f}s 调整 {arg}s)")
+                    if _main_frame_ref:
+                        wx.CallAfter(_main_frame_ref.update_status_message,
+                                     f"快进/退: {new_time_ms / 1000:.1f}s / {_music_duration_ms / 1000:.1f}s")
+            
+            elif command == "quit_thread":
+                logger.info("音频播放线程收到退出命令，正在关闭。")
+                break # 退出循环，线程结束
+
+            audio_command_queue.task_done() # 标记任务完成
+
+        except queue.Empty:
+            # 队列为空，继续等待命令
+            # 可以在这里做一些定期的状态检查或更新
+            if _vlc_player:
+                current_state = _vlc_player.get_state()
+                if current_state == vlc.State.Ended:
+                    if _playback_status != PLAYBACK_STATUS_STOPPED:
+                        logger.info("VLC 播放结束。")
+                        _playback_status = PLAYBACK_STATUS_STOPPED
+                        if _main_frame_ref:
+                            wx.CallAfter(_main_frame_ref.update_status_message, "播放结束。")
+                    # 防止连续触发Ended状态的日志
+                    # _vlc_player.stop() # 确保播放器状态真正停止并重置 - 谨慎使用，可能导致状态误判
+
+                elif current_state == vlc.State.Playing and _playback_status != PLAYBACK_STATUS_PLAYING:
+                    _playback_status = PLAYBACK_STATUS_PLAYING
+                    logger.debug("VLC 播放器状态更新为播放中。")
+                elif current_state == vlc.State.Paused and _playback_status != PLAYBACK_STATUS_PAUSED:
+                    _playback_status = PLAYBACK_STATUS_PAUSED
+                    logger.debug("VLC 播放器状态更新为暂停。")
+                elif current_state == vlc.State.Stopped and _playback_status != PLAYBACK_STATUS_STOPPED:
+                    _playback_status = PLAYBACK_STATUS_STOPPED
+                    logger.debug("VLC 播放器状态更新为停止。")
+        except Exception as e:
+            logger.error(f"音频播放线程发生未处理错误: {e}", exc_info=True)
+
+# 启动音频播放线程
+_audio_thread = threading.Thread(target=_vlc_playback_thread, daemon=True)
 
 def init_audio_system():
-    """初始化 SDL2 和 SDL_mixer 音频系统。"""
-    global _audio_system_initialized
+    """
+    初始化 VLC 音频系统。
+    """
+    global _vlc_instance, _vlc_player, _audio_system_initialized, _audio_thread
 
     if _audio_system_initialized:
-        logger.info("音频系统已初始化过。")
+        logger.info("音频系统已初始化，无需重复初始化。")
         return True
 
-    logger.info("尝试初始化 SDL2 和 SDL_mixer 音频系统...")
-
-    # 初始化 SDL2 的音频子系统
-    if sdl2.SDL_Init(sdl2.SDL_INIT_AUDIO) == -1:
-        error_msg = sdl2.SDL_GetError().decode()
-        logger.error(f"SDL_Init Error: {error_msg}")
-        if _main_frame_ref:
-            # 使用 CallAfter 确保在主线程上更新 GUI
-            wx.CallAfter(_main_frame_ref.show_error_message,
-                        f"SDL2 音频初始化失败。\n错误: {error_msg}\n请确保 SDL2.dll 文件在程序同一目录或系统PATH中。",
-                        "音频初始化失败")
-        return False
-
-    # 定义需要初始化的 SDL_mixer 格式支持（MP3, OGG, FLAC）
-    # 保持你原始代码的 Mix_Init 标志
-    mixer_flags = sdl2.sdlmixer.MIX_INIT_MP3 | \
-                sdl2.sdlmixer.MIX_INIT_OGG | \
-                sdl2.sdlmixer.MIX_INIT_FLAC
-
-    # 初始化 SDL_mixer，并检查是否成功加载了所有要求的格式
-    # Mix_Init 返回成功加载的标志位
-    if (sdl2.sdlmixer.Mix_Init(mixer_flags) & mixer_flags) != mixer_flags:
-        error_msg = sdl2.sdlmixer.Mix_GetError().decode()
-        logger.error(f"Mix_Init Error: {error_msg}")
-
-        # 提供缺失 DLL 的提示
-        missing_dlls = get_mixer_dll_paths()
-        dll_hint = ""
-        if missing_dlls:
-            dll_hint = f"\n提示: 可能缺少以下 DLL 文件: {', '.join(missing_dlls)}。\n请将它们与您的程序放在同一目录或添加到系统PATH中。"
-
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message,
-                        f"SDL_mixer 初始化失败。\n错误: {error_msg}{dll_hint}",
-                        "音频初始化失败")
-        sdl2.SDL_Quit() # 如果 Mix_Init 失败，清理 SDL
-        return False
-
-    # 打开音频设备，设置采样率、格式、声道数和缓冲区大小
-    if sdl2.sdlmixer.Mix_OpenAudio(44100, sdl2.sdlmixer.MIX_DEFAULT_FORMAT, 2, 512) == -1:
-        error_msg = sdl2.sdlmixer.Mix_GetError().decode()
-        logger.error(f"Mix_OpenAudio Error: {error_msg}")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message,
-                        f"无法打开音频设备。\n错误: {error_msg}\n请检查您的声卡和驱动。",
-                        "音频设备错误")
-        sdl2.sdlmixer.Mix_Quit() # 清理 Mixer
-        sdl2.SDL_Quit() # 清理 SDL
-        return False
-
-    # 尝试获取并记录 SDL_mixer 的版本信息
+    logger.info("正在初始化 VLC 音频系统...")
     try:
-        # 现代 PySDL2 的推荐方式
-        mixer_version = sdl2.sdlmixer.get_version()
-        logger.info(f"SDL_mixer version: {mixer_version.major}.{mixer_version.minor}.{mixer_version.patch}")
-    except AttributeError:
-        # 兼容旧版本 PySDL2 的方式
-        try:
-            mixer_version_ptr = sdl2.sdlmixer.Mix_Linked_Version()
-            if mixer_version_ptr:
-                mixer_version = mixer_version_ptr.contents
-                logger.info(f"SDL_mixer linked version: {mixer_version.major}.{mixer_version.minor}.{mixer_version.patch}")
-            else:
-                logger.warning("无法获取 SDL_mixer 链接版本信息。")
-        except Exception as e:
-            logger.warning(f"无法从 Mix_Linked_Version() 获取 SDL_mixer 版本信息: {e}")
-            logger.info("SDL_mixer 模块已加载，但版本信息可能无法直接获取。")
-    except Exception as e:
-        logger.warning(f"无法获取 SDL_mixer 版本信息 (通用错误): {e}")
-        logger.info("SDL_mixer 模块已加载，但版本信息可能无法直接获取。")
+        # --- 指定 libvlc.dll 的路径 ---
+        # python-vlc 会自动查找 libvlc.dll，我们只需确保 VLC_INSTALL_PATH 指向 VLC 的安装目录
+        # 并且 libvlc.dll 存在于该目录下。
+        vlc_dll_dir = VLC_INSTALL_PATH 
+        libvlc_path = os.path.join(vlc_dll_dir, "libvlc.dll")
 
-    logger.info("音频系统 (SDL2/SDL_mixer) 初始化成功。")
-    _audio_system_initialized = True
-    return True
+        if not os.path.exists(libvlc_path):
+            raise FileNotFoundError(f"libvlc.dll 未在指定路径找到: {libvlc_path}")
+        
+        # 设置 vlc 库的搜索路径。python-vlc 会使用此路径找到 libvlc.dll
+        vlc.libvlc_dll_path = libvlc_path
+
+        # 创建 VLC 实例，传递其他需要的命令行参数
+        # --no-video 和 --vout=dummy 是用于纯音频播放的合理参数
+        # 移除 --libvlc-dll 参数，因为它现在通过 vlc.libvlc_dll_path 管理
+        _vlc_instance = vlc.Instance("--no-video", "--vout=dummy")
+        
+        if not _vlc_instance:
+            raise RuntimeError("VLC 实例创建失败。")
+            
+        _vlc_player = _vlc_instance.media_player_new()
+        if not _vlc_player:
+            raise RuntimeError("VLC 播放器创建失败。")
+
+        _audio_system_initialized = True
+        logger.info(f"VLC 音频系统初始化成功。libvlc.dll 路径已配置为: {vlc.libvlc_dll_path}")
+
+        # 确保播放线程只启动一次
+        if not _audio_thread.is_alive():
+            _audio_thread.start()
+            logger.info("VLC 音频播放调度线程已启动。")
+
+        # 注册退出函数，确保清理
+        atexit.register(free_audio_system)
+        logger.info("已注册 free_audio_system 到 atexit。")
+
+        return True
+
+    except FileNotFoundError as e:
+        logger.critical(f"VLC 库文件未找到: {e}", exc_info=True)
+        if _main_frame_ref:
+            wx.CallAfter(_main_frame_ref.show_error_message, f"{e}\n请确认 VLC 已安装，并且 VLC_INSTALL_PATH 变量在 audio_manager.py 中设置正确。\n"
+                         f"当前设置的 VLC 安装路径: {VLC_INSTALL_PATH}", "VLC 库文件未找到")
+        _audio_system_initialized = False
+        return False
+    except RuntimeError as e:
+        logger.critical(f"VLC 运行时错误: {e}", exc_info=True)
+        if _main_frame_ref:
+            wx.CallAfter(_main_frame_ref.show_error_message, f"VLC 运行时错误: {e}", "VLC 初始化错误")
+        _audio_system_initialized = False
+        return False
+    except Exception as e:
+        logger.critical(f"VLC 音频系统初始化失败（未知错误）: {e}", exc_info=True)
+        if _main_frame_ref:
+            wx.CallAfter(_main_frame_ref.show_error_message, f"VLC 音频系统初始化失败：{e}", "VLC 初始化错误")
+        _audio_system_initialized = False
+        return False
 
 def free_audio_system():
-    """在程序退出时释放所有 SDL 和 SDL_mixer 资源。"""
-    global _audio_system_initialized, _current_music, _current_playback_status, _current_file_path, _last_played_file_path
-    if _audio_system_initialized:
-        stop_audio() # 确保停止任何正在播放的音频并释放资源
-        try:
-            sdl2.sdlmixer.Mix_CloseAudio() # 关闭音频设备
-            sdl2.sdlmixer.Mix_Quit()     # 释放 SDL_mixer 模块
-            sdl2.SDL_Quit()              # 释放 SDL 模块
-            logger.info("音频系统 (SDL2/SDL_mixer) 已释放。")
-        except Exception as e:
-            logger.error(f"释放音频系统时出错: {e}", exc_info=True)
-        finally:
-            # 重置全局状态
-            _audio_system_initialized = False
-            _current_playback_status = PLAYBACK_STATUS_STOPPED
-            _current_file_path = None
-            _last_played_file_path = None
+    """
+    释放 VLC 音频系统资源。
+    """
+    global _vlc_instance, _vlc_player, _audio_system_initialized, _audio_thread
 
-# 注册清理函数，确保在程序正常退出时调用
-atexit.register(free_audio_system)
+    if not _audio_system_initialized and not (_audio_thread and _audio_thread.is_alive()):
+        logger.info("音频系统未初始化或线程未运行，无需释放。")
+        return
+
+    logger.info("正在释放 VLC 音频系统资源...")
+
+    # 1. 发送退出线程命令，并等待线程结束
+    if _audio_thread and _audio_thread.is_alive():
+        try:
+            logger.debug("发送 quit_thread 命令给音频线程。")
+            audio_command_queue.put(("quit_thread", None))
+            _audio_thread.join(timeout=2.0) # 等待线程结束
+            if _audio_thread.is_alive():
+                logger.warning("VLC 音频播放线程在超时时间内未能退出。")
+            else:
+                logger.info("VLC 音频播放线程已成功退出。")
+        except Exception as e:
+            logger.error(f"在退出音频线程时发生错误: {e}", exc_info=True)
+
+    # 2. 停止并释放 VLC 播放器
+    if _vlc_player:
+        try:
+            if _vlc_player.is_playing() or _vlc_player.get_state() == vlc.State.Paused:
+                _vlc_player.stop()
+            _vlc_player.release() # 释放播放器资源
+            _vlc_player = None
+            logger.info("VLC 播放器已释放。")
+        except Exception as e:
+            logger.error(f"释放 VLC 播放器时出错: {e}", exc_info=True)
+
+    # 3. 释放 VLC 实例
+    if _vlc_instance:
+        try:
+            _vlc_instance.release() # 释放 VLC 实例
+            _vlc_instance = None
+            logger.info("VLC 实例已释放。")
+        except Exception as e:
+            logger.error(f"释放 VLC 实例时出错: {e}", exc_info=True)
+
+    _audio_system_initialized = False
+    logger.info("VLC 音频系统资源已释放。")
 
 def play_audio(file_path):
-    """开始播放指定的音频文件。"""
-    global _current_music, _current_playback_status, _current_file_path, _last_played_file_path
-
+    """
+    播放指定路径的音频文件。
+    """
     if not _audio_system_initialized:
-        logger.error("音频系统未初始化，无法播放音频。")
+        logger.warning("无法播放音频：音频系统未初始化。")
         if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message, "音频系统未就绪，无法播放。", "播放失败")
+            wx.CallAfter(_main_frame_ref.show_error_message, "音频系统未初始化，无法播放。", "操作错误")
+        return
+    
+    if not os.path.exists(file_path):
+        logger.error(f"文件不存在，无法播放: {file_path}")
+        if _main_frame_ref:
+            wx.CallAfter(_main_frame_ref.show_error_message, f"文件不存在或无法访问: {file_path}", "播放错误")
         return
 
-    # 如果当前有音乐正在播放，先停止并释放它
-    if _current_music:
-        try:
-            sdl2.sdlmixer.Mix_HaltMusic() # 停止当前播放
-            sdl2.sdlmixer.Mix_FreeMusic(_current_music) # 释放音乐对象
-            _current_music = None
-            _current_file_path = None
-            logger.debug("已停止并释放上一个音乐对象。")
-        except Exception as e:
-            logger.error(f"释放上一个音乐对象时出错: {e}", exc_info=True)
-
-    try:
-        logger.info(f"[PLAYBACK] 开始处理播放请求: {os.path.basename(file_path)}")
-        normalized_path = os.path.normpath(file_path) # 规范化文件路径
-
-        # 检查文件是否存在且是一个文件
-        if not os.path.exists(normalized_path):
-            logger.error(f"[PLAYBACK_ERROR] 文件不存在: {normalized_path}")
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message,
-                            f"文件 '{os.path.basename(normalized_path)}' 不存在。\n请检查文件是否已被移动或删除。",
-                            "文件不存在")
-            _current_playback_status = PLAYBACK_STATUS_STOPPED
-            _last_played_file_path = None # 播放失败，清空最后播放路径
-            return
-        if not os.path.isfile(normalized_path):
-            logger.error(f"[PLAYBACK_ERROR] 不是有效文件: {normalized_path}")
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message,
-                            f"'{os.path.basename(normalized_path)}' 不是一个有效的文件。\n请选择一个音频文件。",
-                            "无效文件")
-            _current_playback_status = PLAYBACK_STATUS_STOPPED
-            _last_played_file_path = None # 播放失败，清空最后播放路径
-            return
-
-        logger.debug(f"[PLAYBACK] 尝试加载音乐文件: {normalized_path}")
-        # 使用 UTF-8 编码路径加载音乐文件 (Mix_LoadMUS 需要 bytes)
-        music = sdl2.sdlmixer.Mix_LoadMUS(normalized_path.encode('utf-8'))
-
-        # 检查加载是否成功
-        if not music:
-            error_msg = sdl2.sdlmixer.Mix_GetError().decode()
-            logger.error(f"[PLAYBACK_ERROR] 无法加载音频文件: {error_msg} (File: {normalized_path})")
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message,
-                            f"无法播放文件 '{os.path.basename(file_path)}'。\n原因: {error_msg}\n提示: 检查文件是否损坏，或是否缺少对应的解码器DLL。",
-                            "播放失败")
-            _current_playback_status = PLAYBACK_STATUS_STOPPED
-            _last_played_file_path = None # 播放失败，清空最后播放路径
-            return
-
-        _current_music = music # 保存加载的音乐对象
-        _current_file_path = normalized_path # 保存文件路径
-        logger.debug(f"[PLAYBACK] 音乐文件加载成功，准备播放: {os.path.basename(file_path)}")
-
-        # 开始播放音乐，0 表示只播放一次
-        if sdl2.sdlmixer.Mix_PlayMusic(_current_music, 0) == -1:
-            error_msg = sdl2.sdlmixer.Mix_GetError().decode()
-            logger.error(f"[PLAYBACK_ERROR] 无法开始播放: {error_msg} (File: {normalized_path})")
-            sdl2.sdlmixer.Mix_FreeMusic(_current_music) # 播放失败，释放音乐对象
-            _current_music = None
-            _current_file_path = None
-            _current_playback_status = PLAYBACK_STATUS_STOPPED
-            _last_played_file_path = None # 播放失败，清空最后播放路径
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message,
-                            f"无法开始播放文件 '{os.path.basename(file_path)}'。\n错误: {error_msg}",
-                            "播放启动失败")
-            return
-
-        _current_playback_status = PLAYBACK_STATUS_PLAYING # 更新播放状态
-        _last_played_file_path = normalized_path # 成功播放，记录最后播放路径
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, f"正在播放: {os.path.basename(_current_file_path)}")
-        logger.info(f"[PLAYBACK] 成功开始播放: {os.path.basename(file_path)}")
-
-    except Exception as e:
-        logger.error(f"[PLAYBACK_ERROR] 播放时发生意外错误: {e} (File: {file_path})", exc_info=True)
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message, f"播放文件 '{os.path.basename(file_path)}' 时遇到意外问题。\n错误信息: {e}", "播放错误")
-        if _current_music: # 确保即使发生意外错误，音乐对象也被释放
-            sdl2.sdlmixer.Mix_FreeMusic(_current_music)
-        _current_music = None
-        _current_file_path = None
-        _current_playback_status = PLAYBACK_STATUS_STOPPED
-        _last_played_file_path = None # 播放失败，清空最后播放路径
+    # 发送播放命令到音频线程
+    audio_command_queue.put(("play", file_path))
+    logger.info(f"播放命令已发送: {file_path}")
 
 def stop_audio():
-    """停止当前音频播放并释放相关资源。"""
-    global _current_music, _current_playback_status, _current_file_path, _last_played_file_path
-
-    # 只有在音频系统初始化且有音乐对象时才执行操作
-    if _current_music and _audio_system_initialized:
-        try:
-            # 检查是否正在播放或暂停，如果是，则停止
-            if sdl2.sdlmixer.Mix_PlayingMusic() or sdl2.sdlmixer.Mix_PausedMusic():
-                logger.info("[PLAYBACK_ACTION] 请求停止当前音乐播放。")
-                sdl2.sdlmixer.Mix_HaltMusic()
-                logger.debug("已发送停止音乐播放命令。")
-            else:
-                logger.debug("没有正在播放或暂停的音乐，直接释放资源。")
-
-            sdl2.sdlmixer.Mix_FreeMusic(_current_music) # 释放音乐对象
-            _current_music = None
-            _current_file_path = None
-            _last_played_file_path = None # 停止播放，清空最后播放路径
-            logger.info("[PLAYBACK] 音频播放已停止并释放资源。")
-        except Exception as e:
-            logger.error(f"停止或释放音频播放时出错: {e}", exc_info=True)
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message,
-                            f"停止音频播放时遇到错误: {e}",
-                            "停止错误")
-        finally:
-            _current_playback_status = PLAYBACK_STATUS_STOPPED # 更新状态为停止
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.update_status_message, "已停止播放")
-    else:
-        # 如果没有音乐对象或系统未初始化，确保状态正确
-        logger.debug("[PLAYBACK] 无音频正在播放或音频系统未初始化，无需停止。状态已是停止。")
-        _current_playback_status = PLAYBACK_STATUS_STOPPED
-        _current_file_path = None
-        _last_played_file_path = None # 停止播放，清空最后播放路径
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "播放器空闲")
+    """
+    停止当前正在播放的音频。
+    """
+    if not _audio_system_initialized:
+        logger.warning("尝试停止音频，但音频系统未准备好。")
+        return
+    audio_command_queue.put(("stop", None))
+    logger.info("停止音频命令已发送。")
 
 def pause_audio():
-    """暂停当前音频播放。"""
-    global _current_playback_status
-    logger.info("[PLAYBACK_ACTION] 收到暂停音频请求。")
+    """
+    暂停当前正在播放的音频。
+    """
     if not _audio_system_initialized:
-        logger.warning("音频系统未初始化，无法暂停。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message, "音频系统未就绪，无法暂停。", "暂停失败")
+        logger.warning("无法暂停音频：音频系统未初始化。")
         return
-
-    if not _current_music:
-        logger.warning("没有当前音乐对象，无法暂停。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "播放器空闲，无法暂停")
-        return
-
-    # 只有在当前音乐正在播放时才能暂停
-    if sdl2.sdlmixer.Mix_PlayingMusic():
-        try:
-            sdl2.sdlmixer.Mix_PauseMusic() # 暂停音乐
-            _current_playback_status = PLAYBACK_STATUS_PAUSED # 更新状态
-            logger.info("[PLAYBACK] 音频已成功暂停。")
-            if _main_frame_ref:
-                current_file_name = os.path.basename(_current_file_path) if _current_file_path else "当前文件"
-                wx.CallAfter(_main_frame_ref.update_status_message, f"已暂停: {current_file_name}")
-        except Exception as e:
-            logger.error(f"暂停音频时发生错误: {e}", exc_info=True)
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message, f"暂停音频时遇到错误。\n错误信息: {e}", "暂停错误")
-    elif sdl2.sdlmixer.Mix_PausedMusic():
-        # 如果已经是暂停状态，则不需要重复操作
-        logger.info("[PLAYBACK] 音频已处于暂停状态，无需重复暂停。")
-        if _main_frame_ref:
-            current_file_name = os.path.basename(_current_file_path) if _current_file_path else "当前文件"
-            wx.CallAfter(_main_frame_ref.update_status_message, f"已暂停: {current_file_name} (已是暂停状态)")
-    else:
-        # 如果既不是播放也不是暂停状态（例如播放完毕），则无法执行暂停
-        logger.debug("[PLAYBACK] 音频未在播放或暂停状态，无法执行暂停操作。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "无播放中音频，无法暂停")
+    audio_command_queue.put(("pause", None))
+    logger.info("暂停音频命令已发送。")
 
 def resume_audio():
-    """继续（恢复）之前暂停的音频播放。"""
-    global _current_playback_status
-    logger.info("[PLAYBACK_ACTION] 收到继续播放音频请求。")
+    """
+    恢复暂停的音频。
+    """
     if not _audio_system_initialized:
-        logger.warning("音频系统未初始化，无法继续播放。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message, "音频系统未就绪，无法继续播放。", "继续播放失败")
+        logger.warning("无法恢复音频：音频系统未初始化。")
         return
-
-    if not _current_music:
-        logger.warning("没有当前音乐对象，无法继续播放。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "播放器空闲，无法继续")
-        return
-
-    # 只有在当前音乐已暂停时才能继续
-    if sdl2.sdlmixer.Mix_PausedMusic():
-        try:
-            sdl2.sdlmixer.Mix_ResumeMusic() # 继续播放
-            _current_playback_status = PLAYBACK_STATUS_PLAYING # 更新状态
-            logger.info("[PLAYBACK] 音频已成功继续播放。")
-            if _main_frame_ref:
-                current_file_name = os.path.basename(_current_file_path) if _current_file_path else "当前文件"
-                wx.CallAfter(_main_frame_ref.update_status_message, f"正在播放: {current_file_name}")
-        except Exception as e:
-            logger.error(f"继续播放音频时发生错误: {e}", exc_info=True)
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message, f"继续播放音频时遇到错误。\n错误信息: {e}", "继续播放错误")
-    elif sdl2.sdlmixer.Mix_PlayingMusic():
-        # 如果已经是播放状态，则不需要重复操作
-        logger.info("[PLAYBACK] 音频已处于播放状态，无需重复继续播放。")
-        if _main_frame_ref:
-            current_file_name = os.path.basename(_current_file_path) if _current_file_path else "当前文件"
-            wx.CallAfter(_main_frame_ref.update_status_message, f"正在播放: {current_file_name} (已是播放状态)")
-    else:
-        # 如果未暂停也未播放（例如播放完毕），则无法执行继续操作
-        logger.debug("[PLAYBACK] 音频未在暂停或播放状态，无法执行继续播放操作。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "无暂停音频，无法继续")
+    audio_command_queue.put(("resume", None))
+    logger.info("恢复音频命令已发送。")
 
 def toggle_play_pause():
-    """切换播放和暂停状态。"""
-    logger.info("[PLAYBACK_ACTION] 收到切换播放/暂停请求。")
+    """
+    切换播放/暂停状态。
+    """
     if not _audio_system_initialized:
-        logger.warning("音频系统未初始化，无法切换播放/暂停。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message, "音频系统未就绪。", "操作失败")
+        logger.warning("无法切换播放/暂停：音频系统未初始化。")
         return
+    audio_command_queue.put(("toggle_play_pause", None))
+    logger.info("切换播放/暂停命令已发送。")
 
-    if not _current_music:
-        logger.warning("没有当前音乐对象，无法切换播放/暂停。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "播放器空闲，无法切换")
-        return
-
-    # 首先检查是否已暂停，因为暂停是特定的状态，且恢复操作仅针对暂停
-    if sdl2.sdlmixer.Mix_PausedMusic():
-        logger.info("[PLAYBACK_ACTION] 检测到已暂停，执行继续播放。")
-        resume_audio()
-    elif sdl2.sdlmixer.Mix_PlayingMusic():
-        logger.info("[PLAYBACK_ACTION] 检测到正在播放，执行暂停。")
-        pause_audio()
-    else:
-        # 如果既没播放也没暂停，但 _current_music 存在（例如播放结束但未清理）
-        # 此时应尝试重新播放（从头开始）或停止。
-        # 由于有文件监视器的自动播放逻辑，这里更倾向于什么都不做，除非用户手动点击播放按钮。
-        logger.info("[PLAYBACK_ACTION] 当前无音频播放或暂停中，无法切换播放/暂停状态。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "播放器空闲，无法切换")
-
-def seek_audio(seconds):
+def seek_audio(seconds_delta):
     """
-    跳转到音频的指定秒数位置。
-    seconds: 正数表示快进，负数表示快退。
+    调整音频播放进度。
+    seconds_delta: 正数表示快进，负数表示快退。
     """
-    global _current_music
-
-    logger.info(f"[PLAYBACK_ACTION] 收到跳转音频请求: {seconds} 秒。")
-
-    if not _current_music or not _audio_system_initialized:
-        logger.warning("无音频播放，无法执行快进/快退。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "播放器空闲，无法快进/快退")
+    if not _audio_system_initialized:
+        logger.warning("无法调整进度：音频系统未初始化。")
         return
-
-    # 只有在音乐正在播放或暂停时才能跳转
-    if not (sdl2.sdlmixer.Mix_PlayingMusic() or sdl2.sdlmixer.Mix_PausedMusic()):
-        logger.warning("音频未在播放或暂停状态，无法执行快进/快退。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.update_status_message, "当前无播放，无法快进/快退")
-        return
-
-    current_pos = -1.0 # 初始化为无效位置
-
-    try:
-        # 尝试使用 Mix_GetMusicPlaytime (推荐，应兼容你的 DLL)
-        # 此函数在 SDL_mixer 2.0.10+ 中引入，返回 double 类型的秒数。
-        current_pos = sdl2.sdlmixer.Mix_GetMusicPlaytime(_current_music)
-        logger.debug(f"[SEEK] Mix_GetMusicPlaytime 成功获取当前位置: {current_pos:.3f} 秒。")
-
-    except AttributeError as ae:
-        # 如果 Mix_GetMusicPlaytime 不可用，则尝试 Mix_GetMusicPosition
-        logger.error(f"[SEEK_ERROR] PySDL2 绑定中缺少 Mix_GetMusicPlaytime。尝试 Mix_GetMusicPosition。错误: {ae}", exc_info=False)
-        try:
-            # Mix_GetMusicPosition 也返回秒数（double）
-            current_pos = sdl2.sdlmixer.Mix_GetMusicPosition(_current_music)
-            logger.debug(f"[SEEK] Mix_GetMusicPosition 成功获取当前位置: {current_pos:.3f} 秒。")
-            if current_pos < 0: # 如果返回负值，可能表示不支持或发生错误
-                logger.warning("[SEEK] Mix_GetMusicPosition 返回负值，可能不支持或无法获取精确播放位置。")
-                current_pos = 0.0 # 无法获取真实位置时，强制从头开始计算
-        except AttributeError as ae2:
-            # 如果 Mix_GetMusicPosition 也不可用
-            logger.error(f"[SEEK_ERROR] PySDL2 绑定中也缺少 Mix_GetMusicPosition。无法获取当前播放位置。错误: {ae2}", exc_info=True)
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message,
-                            f"快进/快退失败: 无法获取当前播放位置。\n错误: {ae2}\n请尝试更新 PySDL2 包。",
-                            "播放错误")
-            return
-        except Exception as e_get_pos:
-            logger.error(f"[SEEK_ERROR] 调用 Mix_GetMusicPosition 时发生意外错误: {e_get_pos}", exc_info=True)
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message,
-                            f"快进/快退失败: 获取播放位置时出错。\n错误: {e_get_pos}",
-                            "播放错误")
-            return
-    except Exception as e_get_playtime:
-        # 如果 Mix_GetMusicPlaytime 调用时发生其他错误
-        logger.error(f"[SEEK_ERROR] 调用 Mix_GetMusicPlaytime 时发生意外错误: {e_get_playtime}", exc_info=True)
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message,
-                        f"快进/快退失败: 获取播放时间时出错。\n错误: {e_get_playtime}",
-                        "播放错误")
-        return
-
-    # 如果所有尝试都无法获取有效位置
-    if current_pos < 0:
-        logger.error("[SEEK_FATAL] 无法获取任何有效的当前播放位置，快进/快退将不准确或失败。")
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message,
-                        f"快进/快退功能不可用。\n原因: 无法获取当前播放时间，请确保 PySDL2 已最新安装且兼容您的 SDL2_mixer.dll。",
-                        "播放错误")
-        return
-
-    # 计算新位置
-    new_pos = current_pos + seconds
-    if new_pos < 0:
-        new_pos = 0.0 # 不允许跳转到负数位置（即音频开始之前）
-
-    try:
-        # Mix_SetMusicPosition 参数是 double 类型
-        if sdl2.sdlmixer.Mix_SetMusicPosition(new_pos) == -1:
-            error_msg = sdl2.sdlmixer.Mix_GetError().decode()
-            logger.error(f"[SEEK_ERROR] Mix_SetMusicPosition 失败: {error_msg} (尝试跳至: {new_pos:.3f} 秒)。可能是当前音乐类型不支持。")
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message,
-                            f"快进/快退功能失败。\n错误: {error_msg}\n可能当前音频格式不支持此操作。",
-                            "操作失败")
-        else:
-            # 根据跳转方向更新日志和UI消息
-            action = "快进" if seconds > 0 else "快退"
-            logger.info(f"[PLAYBACK] 音频已 {action} {abs(seconds):.1f} 秒，跳至位置 {new_pos:.1f}。")
-            if _main_frame_ref:
-                current_file_name = os.path.basename(_current_file_path) if _current_file_path else "当前文件"
-                wx.CallAfter(_main_frame_ref.update_status_message, f"正在播放: {current_file_name} ({action})")
-
-    except Exception as e:
-        logger.error(f"[SEEK_ERROR] 执行 Mix_SetMusicPosition 时发生意外错误: {e}", exc_info=True)
-        if _main_frame_ref:
-            wx.CallAfter(_main_frame_ref.show_error_message, f"执行快进/快退时遇到意外问题。\n错误信息: {e}", "播放错误")
+    # 检查是否有媒体正在播放或暂停，并且时长已知，否则seek可能无效
+    if _music_duration_ms <= 0:
+        logger.warning("当前媒体时长未知，无法进行精确跳转。")
+        # 仍然可以尝试发送命令，VLC 可能会处理，但可能不如预期
+    audio_command_queue.put(("seek", seconds_delta))
+    logger.info(f"跳转命令已发送: {seconds_delta}s")
 
 def get_current_playback_status():
-    """返回当前的播放状态。"""
-    return _current_playback_status
+    """
+    获取当前音频播放的状态 ("stopped", "playing", "paused")。
+    """
+    return _playback_status
+
+def get_last_played_file_path():
+    """
+    返回最后一次成功播放的音频文件的路径。
+    """
+    return _last_played_file_path
 
 def check_and_process_audio_queue():
     """
-    检查当前音频播放状态，并处理音频命令队列中的命令。
-    这个函数应该在一个定时器或独立线程中定期调用。
+    这个函数被主线程的定时器调用，用于检查音频命令队列。
+    在 VLC 实现中，此函数的主要作用是让音频线程有机会处理命令和更新状态。
+    此处不需要额外逻辑，因为_vlc_playback_thread负责处理队列。
     """
-    global _current_playback_status 
+    pass # 队列处理已经由 _vlc_playback_thread 完成
 
-    # 如果音频系统未初始化，则清空队列并返回
-    if not _audio_system_initialized:
-        if not audio_command_queue.empty():
-            logger.warning("音频系统未准备好，清空音频命令队列。")
-            while not audio_command_queue.empty():
-                try:
-                    audio_command_queue.get(block=False) # 仅移除，不处理
-                    audio_command_queue.task_done()
-                except queue.Empty:
-                    break
-        return
-
-    # 检查当前音乐播放状态并更新内部状态
-    if _current_music:
-        is_playing = sdl2.sdlmixer.Mix_PlayingMusic()
-        is_paused = sdl2.sdlmixer.Mix_PausedMusic()
-
-        if is_paused: # 优先级最高：如果暂停了，那就是暂停
-            if _current_playback_status != PLAYBACK_STATUS_PAUSED:
-                logger.info("内部状态更新为: 已暂停。")
-                _current_playback_status = PLAYBACK_STATUS_PAUSED
-        elif is_playing: # 如果没有暂停，但正在播放，那就是播放
-            if _current_playback_status != PLAYBACK_STATUS_PLAYING:
-                logger.info("内部状态更新为: 正在播放。")
-                _current_playback_status = PLAYBACK_STATUS_PLAYING
-        else: # 既没有暂停也没有播放，那就是停止（例如文件播放完毕）
-            if _current_playback_status != PLAYBACK_STATUS_STOPPED:
-                logger.info("检测到音乐播放已停止或完成，更新内部状态。")
-                # 调用 stop_audio 来处理停止和资源释放
-                # 注意：stop_audio 会清理 _current_music 和 _current_file_path
-                stop_audio()
-    elif _current_playback_status != PLAYBACK_STATUS_STOPPED:
-        # 如果没有当前音乐对象，但状态不是停止，强制设为停止
-        logger.debug("没有当前音乐对象，但状态不是停止，强制设为停止。")
-        _current_playback_status = PLAYBACK_STATUS_STOPPED
-        global _current_file_path
-        _current_file_path = None
-
-    # 更新GUI状态显示
-    current_file_name_display = "播放器空闲"
-    if _current_file_path:
-        current_file_name_display = os.path.basename(_current_file_path)
-
-    if _main_frame_ref:
-        if _current_playback_status == PLAYBACK_STATUS_PLAYING:
-            wx.CallAfter(_main_frame_ref.update_status_message, f"正在播放: {current_file_name_display}")
-        elif _current_playback_status == PLAYBACK_STATUS_PAUSED:
-            wx.CallAfter(_main_frame_ref.update_status_message, f"已暂停: {current_file_name_display}")
-        elif _current_playback_status == PLAYBACK_STATUS_STOPPED:
-            wx.CallAfter(_main_frame_ref.update_status_message, "播放器空闲")
-
-    # 处理音频命令队列中的命令
-    while not audio_command_queue.empty():
-        try:
-            command, data = audio_command_queue.get(block=False)
-            logger.debug(f"从队列中获取命令: {command} with data: {data}")
-            if command == "play":
-                play_audio(data)
-            elif command == "stop":
-                stop_audio()
-            elif command == "pause":
-                pause_audio()
-            elif command == "resume":
-                resume_audio()
-            elif command == "toggle_play_pause":
-                toggle_play_pause()
-            elif command == "seek":
-                seek_audio(data) # data is the number of seconds to seek
-            else:
-                logger.warning(f"未知音频命令: {command}")
-        except queue.Empty:
-            break # 队列为空，退出循环
-        except Exception as e:
-            logger.error(f"处理音频命令时发生错误: {e}", exc_info=True)
-            if _main_frame_ref:
-                wx.CallAfter(_main_frame_ref.show_error_message, f"处理音频命令时遇到意外问题。\n错误信息: {e}", "音频命令错误")
-        finally:
-            audio_command_queue.task_done() # 标记任务已完成
-
-# --- Nuitka 打包指令建议 ---
-# 为了确保在单文件打包后，所有 DLL 都能被找到，你需要确保它们都被 Nuitka 复制到 .exe 的同级目录。
-#
-# 1. 整理你的 DLLs：
-#    将所有你提到的 DLL (SDL2.dll, SDL2_mixer.dll, libxmp.dll, libwavpack-1.dll, libopusfile-0.dll, libopus-0.dll, libogg-0.dll, libgme.dll)
-#    以及 SDL2_mixer 可能隐式需要的其他 DLL (如 libmpg123-0.dll, libvorbis-0.dll, libvorbisfile-3.dll, FLAC.dll, zlib1.dll 等)
-#    **全部放在你的项目根目录 (与你的 main_app.py 脚本在同一级)。**
-#    例如：
-#    your_project_root/
-#    ├── main_app.py
-#    ├── SDL2.dll
-#    ├── SDL2_mixer.dll
-#    ├── libxmp.dll
-#    ├── libwavpack-1.dll
-#    ├── ... (所有需要的 DLL)
-#    └── utils/
-#        └── logger_config.py
-#
-# 2. 执行 Nuitka 打包命令：
-#    在你项目的根目录下打开命令行，然后运行以下命令。
-#    假设你的主脚本文件是 `main_app.py`：
-
-#    python -m nuitka --standalone --windows-disable-console ^
-#    --onefile ^
-#    --output-dir=dist ^
-#    --include-data-dir=./SDL2.dll=. ^
-#    --include-data-dir=./SDL2_mixer.dll=. ^
-#    --include-data-dir=./libxmp.dll=. ^
-#    --include-data-dir=./libwavpack-1.dll=. ^
-#    --include-data-dir=./libopusfile-0.dll=. ^
-#    --include-data-dir=./libopus-0.dll=. ^
-#    --include-data-dir=./libogg-0.dll=. ^
-#    --include-data-dir=./libgme.dll=. ^
-#    --include-data-dir=./libmpg123-0.dll=. ^
-#    --include-data-dir=./libvorbis-0.dll=. ^
-#    --include-data-dir=./libvorbisfile-3.dll=. ^
-#    --include-data-dir=./FLAC.dll=. ^
-#    --include-data-dir=./zlib1.dll=. ^
-#    --enable-plugin=pyside6 ^ # 如果你使用了 PySide6 (或者 PyQT6)
-#    --enable-plugin=wx.app ^  # 如果你使用了 wxPython
-#    main_app.py
-#
-#    说明：
-#    *   `--onefile`: 核心指令，将所有内容打包成一个单文件可执行文件。
-#    *   `--include-data-dir=./DLL_NAME.dll=.`: 这一部分是关键！它告诉 Nuitka，将当前目录 (`./`) 下的 `DLL_NAME.dll` 文件复制到 **打包后的 `.exe` 的内部文件系统根目录** (`.`)。你需要为每个 DLL 文件都添加一个这样的条目。
-#    *   `--enable-plugin=wx.app`: 推荐为 wxPython 应用启用这个插件，它能更好地处理 wxPython 的内部依赖。
-
-# --- 脚本中的修改总结 ---
-# 1.  **添加 DLL 搜索路径：** 在顶部添加了 `os.add_dll_directory()` 调用，确保程序运行目录和 PySDL2 的 bin 目录优先被搜索。
-# 2.  **`script_dir` 变量的统一：** 现在 `script_dir` 将始终指向程序（或 `.exe`）的实际运行目录，便于文件查找。
-# 3.  **其他代码保持原样：** `init_audio_system` 中的 `mixer_flags` 未做任何改动，`play_audio` 等函数的逻辑也未变。
-
-# --- 示例用法（当脚本直接运行时）
-if __name__ == '__main__':
-    # 创建一个模拟的主窗口用于测试音频管理器功能
-    class MockMainFrame(wx.Frame):
-        def __init__(self):
-            super().__init__(None, title="Audio Manager Test")
-            self.panel = wx.Panel(self)
-            self.status_text = wx.StaticText(self.panel, label="Status: Idle")
-            self.play_button = wx.Button(self.panel, label="Play Test Audio")
-            self.stop_button = wx.Button(self.panel, label="Stop Audio")
-            self.pause_button = wx.Button(self.panel, label="Pause")
-            self.resume_button = wx.Button(self.panel, label="Resume")
-            self.toggle_button = wx.Button(self.panel, label="Toggle Play/Pause")
-            self.forward_button = wx.Button(self.panel, label="Fast Forward 5s")
-            self.rewind_button = wx.Button(self.panel, label="Rewind 5s")
-
-            # 绑定按钮事件到相应的处理函数
-            self.play_button.Bind(wx.EVT_BUTTON, self.on_play)
-            self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
-            self.pause_button.Bind(wx.EVT_BUTTON, self.on_pause)
-            self.resume_button.Bind(wx.EVT_BUTTON, self.on_resume)
-            self.toggle_button.Bind(wx.EVT_BUTTON, self.on_toggle_play_pause)
-            self.forward_button.Bind(wx.EVT_BUTTON, self.on_fast_forward)
-            self.rewind_button.Bind(wx.EVT_BUTTON, self.on_rewind)
-
-            # 设置布局
-            sizer = wx.BoxSizer(wx.VERTICAL)
-            sizer.Add(self.status_text, 0, wx.ALL | wx.EXPAND, 10)
-            sizer.Add(self.play_button, 0, wx.ALL | wx.EXPAND, 10)
-            sizer.Add(self.stop_button, 0, wx.ALL | wx.EXPAND, 10)
-            sizer.Add(self.pause_button, 0, wx.ALL | wx.EXPAND, 10)
-            sizer.Add(self.resume_button, 0, wx.ALL | wx.EXPAND, 10)
-            sizer.Add(self.toggle_button, 0, wx.ALL | wx.EXPAND, 10)
-            sizer.Add(self.forward_button, 0, wx.ALL | wx.EXPAND, 10)
-            sizer.Add(self.rewind_button, 0, wx.ALL | wx.EXPAND, 10)
-
-            self.panel.SetSizer(sizer)
-            self.SetSize((300, 500)) # 设置窗口大小
-
-            # 设置一个定时器来周期性检查音频状态和队列
-            self.timer = wx.Timer(self)
-            self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
-            self.timer.Start(100) # 每 100 毫秒检查一次
-
-            set_frame_reference(self) # 设置全局主窗口引用
-            
-            # 初始化音频系统
-            if not init_audio_system():
-                # 如果音频系统初始化失败，显示错误消息
-                # self.show_error_message("音频系统未能启动，部分功能可能受限。", "系统启动错误")
-                # 已经由 init_audio_system 内部调用 show_error_message
-                pass # 允许程序继续，但音频功能将不可用
-            self.Show() # 显示窗口
-
-        def on_play(self, event):
-            # 尝试找到一个测试音频文件
-            # 优先查找 MP3，如果不存在则尝试生成 WAV
-            test_audio_path = os.path.join(script_dir, "test_audio.mp3")
-            if not os.path.exists(test_audio_path):
-                # 如果MP3文件不存在，尝试生成一个简单的WAV文件
-                try:
-                    import wave
-                    import numpy as np
-                    wav_path = os.path.join(script_dir, "test_audio.wav")
-                    if not os.path.exists(wav_path):
-                        samplerate = 44100
-                        duration = 30.0 # 增加时长以便测试跳转
-                        frequency = 440.0
-                        amplitude = 0.5
-                        t = np.linspace(0., duration, int(samplerate * duration), endpoint=False)
-                        data = amplitude * np.sin(2. * np.pi * frequency * t)
-                        data_int16 = (data * 32767).astype(np.int16) # 转换为 16 位 PCM
-                        with wave.open(wav_path, 'wb') as wf:
-                            wf.setnchannels(1) # 单声道
-                            wf.setsampwidth(2) # 16 位采样宽度
-                            wf.setframerate(samplerate)
-                            wf.writeframes(data_int16.tobytes())
-                        print(f"Generated {wav_path}") # 打印生成信息
-                    test_audio_path = wav_path # 使用生成的WAV文件进行测试
-                except ImportError:
-                    print("numpy 或 wave 模块未安装，无法生成测试WAV文件。")
-                except Exception as e:
-                    print(f"生成 WAV 文件时出错: {e}")
-
-
-            if not os.path.exists(test_audio_path):
-                # 如果仍然找不到测试文件，提示用户
-                wx.MessageBox(f"请在 '{script_dir}' 目录下放置一个 'test_audio.mp3' 或 'test_audio.wav' 文件进行测试。", "文件缺失", wx.ICON_WARNING)
-                return
-
-            # 将播放命令放入队列
-            audio_command_queue.put(("play", test_audio_path))
-            self.update_status_message(f"发送播放命令: {os.path.basename(test_audio_path)}")
-
-        def on_stop(self, event):
-            audio_command_queue.put(("stop", None)) # 发送停止命令
-            self.update_status_message("发送停止命令")
-
-        def on_pause(self, event):
-            audio_command_queue.put(("pause", None)) # 发送暂停命令
-            self.update_status_message("发送暂停命令")
-
-        def on_resume(self, event):
-            audio_command_queue.put(("resume", None)) # 发送继续播放命令
-            self.update_status_message("发送继续播放命令")
-
-        def on_toggle_play_pause(self, event):
-            audio_command_queue.put(("toggle_play_pause", None)) # 发送切换命令
-            self.update_status_message("发送切换播放/暂停命令")
-
-        def on_fast_forward(self, event):
-            audio_command_queue.put(("seek", DEFAULT_SEEK_STEP)) # 发送快进命令
-            self.update_status_message("发送快进命令")
-
-        def on_rewind(self, event):
-            audio_command_queue.put(("seek", -DEFAULT_SEEK_STEP)) # 发送快退命令
-            self.update_status_message("发送快退命令")
-
-        def on_timer(self, event):
-            # 定时器事件处理，调用检查和处理队列的函数
-            check_and_process_audio_queue()
-
-        def update_status_message(self, message):
-            """更新状态栏文本。"""
-            self.status_text.SetLabel(f"Status: {message}")
-            self.panel.Layout() # 重新布局以显示更新
-
-        def show_error_message(self, message, title="错误"):
-            """显示一个错误消息对话框。"""
-            wx.MessageBox(message, title, wx.OK | wx.ICON_ERROR)
-            self.update_status_message(f"错误: {message}") # 同时更新状态栏
-
-    # 运行WX主循环
-    app = wx.App(False)
-    frame = MockMainFrame()
-    app.MainLoop()
+logger.info("audio_manager 模块已加载。")

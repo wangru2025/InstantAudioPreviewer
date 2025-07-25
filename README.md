@@ -31,7 +31,7 @@
 ## 技术栈
 *   **Python:** 3.12.10
 *   **GUI库:** wxWidgets (通过 `wxPython`)
-*   **音频库:** SDL2/SDL_mixer (通过 `PySDL2`)
+*   **音频库:** **VLC (通过 `python-vlc`)**
 *   **数据库:** SQLite (用于标签管理)
 *   **屏幕阅读器API:** NVDA Controller Client API, 争渡读屏API (通过自定义封装实现)
 
@@ -40,8 +40,7 @@
 ### 前置条件
 *   Windows 操作系统
 *   已安装 Python 3.12.10
-*   已安装 wxPython
-*   已安装 PySDL2 (或确保 SDL2/SDL_mixer 可用)
+*   **已安装 VLC 媒体播放器（推荐使用最新稳定版本）**
 *   （可选）如果需要使用NVDA相关的API，请确保你的系统已安装NVDA。
 *   （可选）如果需要使用争渡读屏相关的API，请确保你的系统已安装争渡读屏。
 

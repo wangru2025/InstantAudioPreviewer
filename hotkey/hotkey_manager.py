@@ -65,17 +65,22 @@ CONFIG_FILE_NAME = "hotkeys.dat"
 
 # 全局存储已注册的快捷键及其对应的功能名和修饰键组合
 # { hotkey_string_normalized: func_name } (例如 'ctrl+alt+t')
-_registered_hotkeys_map = {}
+# 在 _keyboard_event_handler 中，我们通过实时获取按键来匹配，而不是依赖于这个全局map的键。
+# 这个map主要用于 _register_hotkeys 内部维护注册信息。
+_registered_hotkey_info = {} # 存储 {hotkey_string_normalized: func_name}
+
+# 存储每个快捷键的修饰键集合，用于 _keyboard_event_handler 实时判断
 # { hotkey_string_normalized: set_of_modifier_strings_lower } (例如 {'ctrl', 'alt'})
 _hotkey_modifiers_map = {}
+
 
 # 确保在程序退出时停止键盘监听
 @atexit.register
 def _stop_keyboard_listening():
     logger.info("程序退出：停止 keyboard 库的全局监听并解除所有热键。")
     keyboard.unhook_all() # 停止所有钩子
-    # 理论上，关闭程序时操作系统会自动释放进程注册的热键，但显式解除是好习惯。
-    # 这里我们只管理 keyboard 库的钩子，WinAPI 注册的热键会在 test_hotkey_conflict 中自行解除。
+    # 这里我们不直接解除 WinAPI 注册的热键，因为在Windows上，进程退出会自动清理。
+    # 并且我们只使用 WinAPI 检测冲突，不主动注册。
 
 
 class HotkeyManager:
@@ -225,9 +230,7 @@ class HotkeyManager:
         self._save_config() # 重新保存一次，以确保配置文件的结构与当前定义的功能列表一致
 
     def _get_default_hotkey_values(self):
-        """返回默认的快捷键映射。这只用于用户点击“重置为默认值”时，
-           或作为参考，不用于初始加载时填充新功能。
-        """
+        """返回默认的快捷键配置。"""
         return {
             "toggle_monitor": "ctrl+alt+shift+t",
             "toggle_visibility": "ctrl+alt+shift+v",
@@ -284,7 +287,7 @@ class HotkeyManager:
         """
         # Step 1: 将 UI 提供的键名转换为 keyboard 库使用的规范化小写键名
         parts = []
-        mod_keys_lower = set()
+        mod_keys_lower_set = set() # 使用集合存储小写修饰键名
 
         # 处理修饰键
         if mod_list_str:
@@ -293,10 +296,10 @@ class HotkeyManager:
                 if m_lower:
                     # 'win' 是 keyboard 库使用的 Windows 键名
                     if m_lower == 'win':
-                        parts.append('windows')
+                        parts.append('windows') # 统一为 'windows'
                     else:
                         parts.append(m_lower)
-                    mod_keys_lower.add(m_lower) # 存储为 'ctrl', 'alt', 'shift', 'win'
+                    mod_keys_lower_set.add(m_lower) # 存储为 'ctrl', 'alt', 'shift', 'windows'
 
         # 处理普通键
         key_str_for_keyboard = ""
@@ -314,7 +317,8 @@ class HotkeyManager:
         modifier_order = ["alt", "ctrl", "shift", "windows"] # keyboard 库的默认修饰键排序
 
         # 过滤掉不存在的修饰键，并按指定顺序排序
-        sorted_modifiers_for_hotkey_str = [m for m in modifier_order if m in parts]
+        sorted_modifiers_for_hotkey_str = sorted([m for m in mod_keys_lower_set if m in modifier_order],
+                                                 key=lambda x: modifier_order.index(x))
 
         # 添加普通键，确保它不在修饰键列表中
         final_parts = sorted_modifiers_for_hotkey_str
@@ -348,7 +352,7 @@ class HotkeyManager:
             if vk_code is not None: # 只有当成功解析出VK_CODE时才进行系统冲突检测
                 if self.test_hotkey_conflict(mod_flags, vk_code):
                     return False, "该快捷键已被其他程序占用。"
-            elif key_str:
+            elif key_str: # 如果有key_str但未能解析，则不进行冲突检测
                 logger.warning(f"无法将 '{mod_list_str} + {key_str}' 解析为 WinAPI 键码，跳过系统级冲突检测。")
 
         # Step 3: 更新配置并重新注册
@@ -377,6 +381,7 @@ class HotkeyManager:
                 has_regular_key = True
                 break
         return has_regular_key and len(parts) > 0 # 至少要有一个键
+
 
     def _parse_hotkey_string_for_winapi(self, mod_list_str, key_str_ui):
         """
@@ -509,62 +514,58 @@ class HotkeyManager:
 
     def _unregister_hotkeys(self):
         """
-        清除所有在 keyboard 库中注册的快捷键映射。
-        这里通过清除 _registered_hotkeys_map 来控制 _keyboard_event_handler 的行为，
-        让它不再响应旧的热键。
+        清除所有在 _registered_hotkey_info 和 _hotkey_modifiers_map 中存储的注册信息。
+        这样 _keyboard_event_handler 就不会再匹配这些快捷键了。
         """
-        global _registered_hotkeys_map, _hotkey_modifiers_map
         logger.info("解除所有内部热键映射。")
-        _registered_hotkeys_map.clear()
+        _registered_hotkey_info.clear()
         _hotkey_modifiers_map.clear()
         self._active_hotkey_presses.clear() # 清空活跃按键状态
-        # keyboard.unhook_all() # 不在每次更新时unhook_all，因为这会移除我们的全局hook，而是依赖map的清空。
-                               # 只要全局hook还在，它就会根据_registered_hotkeys_map来判断
 
     def _register_hotkeys(self):
         """
-        根据 self.hotkeys 字典重新注册所有快捷键映射。
-        这些映射供 _keyboard_event_handler 使用。
+        根据 self.hotkeys 字典重新填充 _registered_hotkey_info 和 _hotkey_modifiers_map。
+        _keyboard_event_handler 将根据这两个全局变量进行匹配。
         """
-        global _registered_hotkeys_map, _hotkey_modifiers_map
-        _registered_hotkeys_map.clear()
+        global _registered_hotkey_info, _hotkey_modifiers_map
+        _registered_hotkey_info.clear()
         _hotkey_modifiers_map.clear()
+
+        # keyboard 库的修饰键顺序 (用于生成匹配键)
+        modifier_order_kb = ["alt", "ctrl", "shift", "windows"]
 
         for func_name, hotkey_str in self.hotkeys.items():
             if hotkey_str:
                 try:
-                    # 规范化 hotkey_str (排序修饰键，如 'ctrl+alt+windows'，然后是普通键)
-                    # 这里的 hotkey_str 已经是内部规范化后的字符串
                     parts = hotkey_str.split('+')
+                    current_modifiers_lower = set()
+                    key_part_lower = None
+
                     # 识别修饰键和普通键
-                    mod_parts = []
-                    key_part = None
                     for p in parts:
                         p_lower = p.lower()
                         if p_lower in {"ctrl", "alt", "shift", "windows"}:
-                            mod_parts.append(p_lower)
+                            current_modifiers_lower.add(p_lower)
                         else:
-                            key_part = p_lower
+                            key_part_lower = p_lower # 最后一个非修饰键是普通键
 
-                    if key_part:
-                        # 再次规范化，确保修饰键顺序
-                        modifier_order = ["alt", "ctrl", "shift", "windows"]
-                        sorted_mods_for_map = sorted(mod_parts, key=lambda x: modifier_order.index(x) if x in modifier_order else len(modifier_order))
+                    if key_part_lower:
+                        # 确保修饰键排序一致，以便生成唯一的匹配键
+                        sorted_modifiers_for_map = sorted(list(current_modifiers_lower),
+                                                          key=lambda x: modifier_order_kb.index(x) if x in modifier_order_kb else len(modifier_order_kb))
 
-                        normalized_hotkey_for_map = "+".join(sorted_mods_for_map + [key_part])
+                        normalized_hotkey_for_map = "+".join(sorted_modifiers_for_map + [key_part_lower])
 
-                        _registered_hotkeys_map[normalized_hotkey_for_map] = func_name
-                        _hotkey_modifiers_map[normalized_hotkey_for_map] = set(mod_parts)
+                        _registered_hotkey_info[normalized_hotkey_for_map] = func_name
+                        _hotkey_modifiers_map[normalized_hotkey_for_map] = current_modifiers_lower # 存储原始的修饰键集合
                         logger.info(f"已注册内部快捷键映射: '{normalized_hotkey_for_map}' for {func_name}")
                     else:
                         logger.warning(f"快捷键 '{hotkey_str}' for {func_name} 无普通按键，无法注册。")
 
                 except Exception as e:
                     logger.error(f"注册快捷键 '{hotkey_str}' for {func_name} 失败: {e}.", exc_info=True)
-            else:
-                logger.debug(f"功能 '{func_name}' 没有设置快捷键。跳过注册。")
 
-        logger.info(f"所有 {len(_registered_hotkeys_map)} 个快捷键已成功注册。")
+        logger.info(f"所有 {len(_registered_hotkey_info)} 个快捷键已成功注册。")
 
 
     def _keyboard_event_handler(self, event):
@@ -575,34 +576,38 @@ class HotkeyManager:
         if not event or not event.name:
             return False
 
-        if not _registered_hotkeys_map:
-            return False # 没有注册的快捷键，直接放行
+        # 如果没有注册的快捷键，直接返回 False
+        if not _registered_hotkey_info:
+            return False
 
-        current_modifiers = set()
-        # 注意：keyboard 库的修饰键名称是小写的
-        if keyboard.is_pressed('ctrl'): current_modifiers.add('ctrl')
-        if keyboard.is_pressed('alt'): current_modifiers.add('alt')
-        if keyboard.is_pressed('shift'): current_modifiers.add('shift')
-        if keyboard.is_pressed('windows'): current_modifiers.add('windows') # keyboard 库用 'windows'
+        # 获取当前按下的所有修饰键 (keyboard 库的名称是小写的)
+        current_modifiers_set = set()
+        if keyboard.is_pressed('ctrl'): current_modifiers_set.add('ctrl')
+        if keyboard.is_pressed('alt'): current_modifiers_set.add('alt')
+        if keyboard.is_pressed('shift'): current_modifiers_set.add('shift')
+        if keyboard.is_pressed('windows'): current_modifiers_set.add('windows') # keyboard 库用 'windows'
 
-        # 将 event.name 转换为我们内部规范化后的键名
-        key_name_lower = event.name.lower() # event.name 已经是 keyboard 库的标准名，如 'right', 'enter'
+        # 获取当前按下的普通键 (event.name 已经是 keyboard 库的标准名，如 'right', 'enter', 'a', 'f1')
+        key_name_lower = event.name.lower()
 
         # 构建当前按键组合的规范化字符串，用于查找
         # 确保修饰键排序一致 ('alt', 'ctrl', 'shift', 'windows')
-        modifier_order = ["alt", "ctrl", "shift", "windows"]
-        sorted_modifiers = sorted(list(current_modifiers), key=lambda x: modifier_order.index(x) if x in modifier_order else len(modifier_order))
+        modifier_order_kb = ["alt", "ctrl", "shift", "windows"]
+        sorted_modifiers_for_handler = sorted(list(current_modifiers_set),
+                                              key=lambda x: modifier_order_kb.index(x) if x in modifier_order_kb else len(modifier_order_kb))
 
-        current_hotkey_str_normalized = "+".join(sorted_modifiers + [key_name_lower])
+        current_hotkey_str_normalized = "+".join(sorted_modifiers_for_handler + [key_name_lower])
 
         # logger.debug(f"Event: {event.event_type}, Key: {event.name}, Full combo: {current_hotkey_str_normalized}")
 
-        func_name = _registered_hotkeys_map.get(current_hotkey_str_normalized)
+        # 查找匹配的函数名
+        func_name = _registered_hotkey_info.get(current_hotkey_str_normalized)
 
         if func_name: # 如果是注册的快捷键
             if event.event_type == keyboard.KEY_DOWN:
+                # 避免重复触发按下事件 (例如，连续按键事件会触发多次 KEY_DOWN)
                 if (func_name, current_hotkey_str_normalized) not in self._active_hotkey_presses:
-                    # 防止因为系统延迟导致重复按压事件
+                    # 检查是否有快速重复按下的情况，以防万一
                     if func_name in self._last_release_times and \
                        (time.time() - self._last_release_times[func_name]) < 0.1: # 100ms 间隔
                         # logger.debug(f"Too quick press for {func_name}, ignoring.")
@@ -612,19 +617,19 @@ class HotkeyManager:
                     logger.debug(f"Hotkey DOWN detected: {current_hotkey_str_normalized} ({func_name})")
                     # 将事件发布到主 UI 线程
                     wx.CallAfter(self.parent_frame.handle_hotkey_event, HotkeyEvent(func_name, is_pressed=True))
-                    return True # 阻止事件向下传递
+                    return True # 阻止事件向下传递，意味着此事件已被处理
 
             elif event.event_type == keyboard.KEY_UP:
-                # 解决问题2：处理快捷键释放事件 (main_frame.py 中的 on_hotkey_release_event 需要此事件)
+                # 处理快捷键释放事件
                 if (func_name, current_hotkey_str_normalized) in self._active_hotkey_presses:
                     self._active_hotkey_presses.remove((func_name, current_hotkey_str_normalized))
                     self._last_release_times[func_name] = time.time() # 记录释放时间
                     logger.debug(f"Hotkey UP detected: {current_hotkey_str_normalized} ({func_name})")
+                    # 调用 MyFrame 中的释放事件处理方法
                     wx.CallAfter(self.parent_frame.on_hotkey_release_event, func_name)
                     return True # 阻止事件向下传递
 
         return False # 不是我们处理的快捷键，让事件继续传递
-
 
 # --- 自定义 wx.Event 类型 ---
 EVT_HOTKEY_TRIGGERED_ID = wx.NewIdRef()
